@@ -1,0 +1,4 @@
+"0","preds %>%"
+"0","  pr_curve(truth = income, `.pred_>50K`) %>%"
+"0","  autoplot() +"
+"0","  labs(title = sprintf(""Courbe Precision-Recall — %s"", label_occ))"

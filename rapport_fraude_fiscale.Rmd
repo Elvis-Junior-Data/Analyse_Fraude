@@ -1,0 +1,532 @@
+---
+title: "Détection de Fraude Fiscale — Rapport Analytique"
+subtitle: "`r if(params$occupation == 'All') 'Toutes professions — Vue Globale' else paste('Profession :', params$occupation)`"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+author: "Groupe 4 — M1 R Avancée"
+params:
+  occupation: "All"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    number_sections: true
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  fig.align  = "center",
+  cache   = FALSE
+)
+
+library(tidyverse)
+library(janitor)
+library(tidymodels)
+library(themis)
+library(vip)
+library(gt)
+library(corrplot)
+library(yardstick)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+set.seed(2026)
+
+# ---- Import & nettoyage ----
+col_names <- c(
+  "age", "workclass", "fnlwgt", "education", "education_num",
+  "marital_status", "occupation", "relationship", "race", "sex",
+  "capital_gain", "capital_loss", "hours_per_week", "native_country", "income"
+)
+
+adult_raw <- bind_rows(
+  read_csv("data/adult.data",
+           col_names = col_names, trim_ws = TRUE,
+           na = c("", "NA", "?"), show_col_types = FALSE) %>%
+    mutate(split = "train"),
+  read_csv("data/adult.test",
+           col_names = col_names, skip = 1, trim_ws = TRUE,
+           na = c("", "NA", "?"), show_col_types = FALSE) %>%
+    mutate(split = "test")
+)
+
+adult_clean <- adult_raw %>%
+  mutate(income = str_remove(income, "\\.") %>% str_trim()) %>%
+  clean_names() %>%
+  mutate(
+    across(c(workclass, education, marital_status, occupation,
+             relationship, race, sex, native_country, income, split), as.factor),
+    income = fct_relevel(income, ">50K")
+  ) %>%
+  drop_na()
+
+# ---- Feature engineering ----
+adult_fe <- adult_clean %>%
+  mutate(
+    age_group = case_when(
+      age < 25 ~ "Jeune (<25)",
+      age < 40 ~ "Adulte (25-39)",
+      age < 55 ~ "Expérimenté (40-54)",
+      TRUE     ~ "Senior (55+)"
+    ) %>% factor(levels = c("Jeune (<25)", "Adulte (25-39)",
+                             "Expérimenté (40-54)", "Senior (55+)")),
+    capital_net     = capital_gain - capital_loss,
+    high_hours      = factor(if_else(hours_per_week > 50, "Oui", "Non")),
+    education_score = education_num,
+    has_capital     = factor(if_else(capital_gain > 0 | capital_loss > 0, "Oui", "Non"))
+  )
+
+# ---- Label lisible pour la profession ----
+label_occ <- if (params$occupation == "All") "Toutes professions" else params$occupation
+
+# ---- Filtrage selon paramètre occupation ----
+if (params$occupation != "All") {
+  adult_fe <- adult_fe %>% filter(occupation == params$occupation)
+}
+
+# ---- KPIs ----
+n_total  <- nrow(adult_fe)
+n_50k    <- sum(adult_fe$income == ">50K")
+taux_50k <- n_50k / n_total
+
+# ---- Modélisation (train uniquement) ----
+data_model <- adult_fe %>% filter(split == "train") %>% select(-split)
+splits_mod <- initial_split(data_model, prop = 0.8, strata = income)
+train_d    <- training(splits_mod)
+test_d     <- testing(splits_mod)
+folds_cv   <- vfold_cv(train_d, v = 5, strata = income)
+
+rec <- recipe(income ~ ., data = train_d) %>%
+  step_rm(fnlwgt, education) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(income, over_ratio = 0.8)
+
+log_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>% set_mode("classification")
+
+log_wf   <- workflow() %>% add_recipe(rec) %>% add_model(log_spec)
+log_grid <- grid_regular(penalty(range = c(-4, 0)), mixture(range = c(0, 1)), levels = 5)
+
+log_res <- tune_grid(
+  log_wf, resamples = folds_cv, grid = log_grid,
+  metrics = metric_set(roc_auc, f_meas),
+  control = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_params <- select_best(log_res, metric = "roc_auc")
+final_wf    <- finalize_workflow(log_wf, best_params)
+final_fit   <- last_fit(final_wf, splits_mod)
+preds       <- collect_predictions(final_fit)
+
+auc_final <- roc_auc(preds, truth = income, `.pred_>50K`)$.estimate
+f1_final  <- f_meas(preds, truth = income, estimate = .pred_class)$.estimate
+```
+
+# Résumé exécutif {.unnumbered}
+
+`r if (params$occupation == "All") { "Ce rapport analyse l'ensemble du jeu de données **Adult Income (UCI)** pour identifier les contribuables à risque de sous-déclaration fiscale (revenu > 50 K$), toutes professions confondues." } else { sprintf("Ce rapport est **filtré sur la profession : %s**. Il analyse les caractéristiques spécifiques de ce groupe et évalue leur risque de sous-déclaration fiscale (revenu > 50 K$).", params$occupation) }`
+
+> **Périmètre d'analyse :** `r label_occ` — `r format(n_total, big.mark=" ")` individus
+
+```{r kpis, echo=FALSE}
+tibble(
+  Indicateur = c("Individus analysés", "Individus >50K$", "Taux de risque", "AUC-ROC final"),
+  Valeur = c(
+    format(n_total, big.mark = " "),
+    format(n_50k,   big.mark = " "),
+    percent(taux_50k, accuracy = 0.1),
+    as.character(round(auc_final, 3))
+  )
+) %>%
+  gt() %>%
+  tab_header(title = sprintf("KPIs Clés — %s", label_occ)) %>%
+  tab_style(style = cell_fill(color = "#2C3E50"),
+            locations = cells_column_labels()) %>%
+  tab_style(style = cell_text(color = "white", weight = "bold"),
+            locations = cells_column_labels()) %>%
+  tab_style(style = cell_text(weight = "bold", color = "#E74C3C"),
+            locations = cells_body(rows = Indicateur == "AUC-ROC final"))
+```
+
+- **Individus totaux** : `r format(n_total, big.mark=" ")`
+- **Individus >50K$** : `r format(n_50k, big.mark=" ")`
+- **Taux de risque** : `r percent(taux_50k, accuracy=0.1)`
+- **AUC-ROC final** : `r round(auc_final, 3)`
+
+---
+
+# Présentation des données
+
+`r if (params$occupation != "All") sprintf("Les statistiques ci-dessous portent uniquement sur les individus de la profession **%s** (n = %d).", params$occupation, n_total)`
+
+## Description des variables
+
+```{r description-variables}
+tibble(
+  Variable = col_names,
+  Description = c(
+    "Âge de l'individu", "Classe de travail (8 niveaux)",
+    "Poids de pondération finale", "Niveau d'éducation (16 niveaux)",
+    "Niveau d'éducation (numérique)", "Statut marital (7 niveaux)",
+    "Catégorie professionnelle (14 niveaux)", "Relation dans le foyer (6 niveaux)",
+    "Origine ethnique (5 niveaux)", "Sexe (binaire)",
+    "Gains en capital (USD)", "Pertes en capital (USD)",
+    "Heures travaillées par semaine", "Pays d'origine (41 niveaux)",
+    "Revenu > 50K$ (cible binaire)"
+  ),
+  Type = c(
+    "Numérique", "Catégorielle", "Numérique", "Catégorielle",
+    "Numérique", "Catégorielle", "Catégorielle", "Catégorielle",
+    "Catégorielle", "Binaire", "Numérique", "Numérique",
+    "Numérique", "Catégorielle", "Binaire"
+  )
+) %>%
+  gt() %>%
+  tab_header(title = "Description des variables — Adult Income Dataset") %>%
+  tab_style(style = cell_fill(color = "#EBF5FB"),
+            locations = cells_body(rows = seq(1, 15, 2)))
+```
+
+## Valeurs manquantes avant nettoyage
+
+```{r na-analysis}
+adult_raw %>%
+  mutate(income = str_remove(income, "\\.") %>% str_trim()) %>%
+  clean_names() %>%
+  mutate(across(where(is.character), ~ na_if(., "?"))) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "NA_count") %>%
+  filter(NA_count > 0) %>%
+  mutate(pct = percent(NA_count / nrow(adult_raw), accuracy = 0.1)) %>%
+  gt() %>%
+  tab_header(title = "Variables avec valeurs manquantes ('?')") %>%
+  cols_label(Variable = "Variable", NA_count = "Nb. NA", pct = "% NA")
+```
+
+## Déséquilibre de classes
+
+```{r desequilibre}
+adult_fe %>%
+  count(income) %>%
+  mutate(Proportion = percent(n / sum(n), accuracy = 0.1)) %>%
+  gt() %>%
+  tab_header(title = sprintf("Répartition de `income` — %s", label_occ))
+```
+
+---
+
+# Analyse exploratoire
+
+`r if (params$occupation != "All") sprintf("Tous les graphiques ci-dessous sont calculés sur le sous-ensemble **%s** uniquement.", params$occupation)`
+
+## Distribution de la variable cible
+
+```{r eda-income}
+adult_fe %>%
+  count(income) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = income, y = n, fill = income)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%d\n(%.1f%%)", n, pct)), vjust = -0.3, size = 4) +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = sprintf("Distribution de `income` — %s", label_occ),
+       x = NULL, y = "Effectif") +
+  theme_minimal(base_size = 13)
+```
+
+## Distribution de l'âge
+
+```{r eda-age}
+adult_fe %>%
+  ggplot(aes(x = age, fill = income)) +
+  geom_histogram(binwidth = 3, position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = c("#E74C3C", "#3498DB")) +
+  labs(title = sprintf("Distribution de l'âge — %s", label_occ),
+       x = "Âge", y = "Effectif", fill = "Revenu") +
+  theme_minimal(base_size = 13)
+```
+
+```{r obs-age, echo=FALSE, results='asis'}
+if (params$occupation != "All") {
+  cat(sprintf(
+    "> **Profil %s :** age median = %d ans, taux >50K$ = %s.",
+    params$occupation,
+    as.integer(median(adult_fe$age)),
+    percent(taux_50k, accuracy = 0.1)
+  ))
+} else {
+  cat("> **Observation :** Les individus a revenu >50K$ sont concentres entre 35 et 55 ans.")
+}
+```
+
+## Capital gain par classe
+
+```{r eda-capital}
+adult_fe %>%
+  filter(capital_gain > 0) %>%
+  ggplot(aes(x = income, y = capital_gain, fill = income)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  scale_y_log10(labels = dollar) +
+  scale_fill_manual(values = c("#E74C3C", "#3498DB")) +
+  labs(title = sprintf("Capital gain (non-nul) — %s", label_occ),
+       x = NULL, y = "Capital gain (log$)", fill = "Revenu") +
+  theme_minimal(base_size = 13)
+```
+
+## Heures travaillées par semaine
+
+```{r eda-heures}
+adult_fe %>%
+  ggplot(aes(x = hours_per_week, fill = income)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#E74C3C", "#3498DB")) +
+  labs(title = sprintf("Heures travaillées/semaine — %s", label_occ),
+       x = "Heures/semaine", y = "Densité", fill = "Revenu") +
+  theme_minimal(base_size = 13)
+```
+
+`r if (params$occupation != "All") sprintf("> Parmi les **%s**, %.1f%% travaillent plus de 50h/semaine.", params$occupation, mean(adult_fe$hours_per_week > 50)*100)`
+
+## Taux de >50K$ par niveau d'éducation
+
+```{r eda-education}
+adult_fe %>%
+  group_by(education) %>%
+  summarise(taux_risque = mean(income == ">50K"), n = n()) %>%
+  filter(n > 10) %>%
+  mutate(education = fct_reorder(education, taux_risque)) %>%
+  ggplot(aes(x = education, y = taux_risque, fill = taux_risque)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_gradient(low = "#85C1E9", high = "#E74C3C") +
+  coord_flip() +
+  labs(title = sprintf("Taux >50K$ par niveau d'éducation — %s", label_occ),
+       x = NULL, y = "Taux") +
+  theme_minimal(base_size = 13)
+```
+
+## Taux de risque par statut marital
+
+```{r eda-marital}
+adult_fe %>%
+  group_by(marital_status) %>%
+  summarise(taux_risque = mean(income == ">50K"), n = n()) %>%
+  filter(n > 10) %>%
+  mutate(marital_status = fct_reorder(marital_status, taux_risque)) %>%
+  ggplot(aes(x = marital_status, y = taux_risque, fill = taux_risque)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_gradient(low = "#85C1E9", high = "#E74C3C") +
+  coord_flip() +
+  labs(title = sprintf("Taux >50K$ par statut marital — %s", label_occ),
+       x = NULL, y = "Taux") +
+  theme_minimal(base_size = 13)
+```
+
+## Matrice de corrélation
+
+```{r correlation-matrix, fig.height=5}
+vars_num <- adult_fe %>%
+  select(age, fnlwgt, education_num, capital_gain, capital_loss,
+         hours_per_week, capital_net, education_score) %>%
+  cor()
+
+corrplot(vars_num, method = "color", type = "upper",
+         tl.col = "black", addCoef.col = "black",
+         number.cex = 0.65,
+         title = sprintf("Corrélations — %s", label_occ),
+         mar = c(0, 0, 1, 0))
+```
+
+---
+
+# Feature Engineering
+
+## Variables créées
+
+| Variable | Définition | Justification |
+|---|---|---|
+| `age_group` | Tranche d'âge (4 catégories) | Relation non-linéaire âge–revenu |
+| `capital_net` | `capital_gain - capital_loss` | Solde effectif d'activité financière |
+| `high_hours` | `hours_per_week > 50` | Sur-travail comme signal de revenu élevé |
+| `education_score` | Copie ordinale de `education_num` | Lisibilité dans le pipeline |
+| `has_capital` | `capital_gain > 0` OU `capital_loss > 0` | Participation aux marchés financiers |
+
+```{r fe-stats-occ, echo=FALSE, results='asis'}
+if (params$occupation != "All") {
+  cat(sprintf(
+    "Pour la profession **%s** : %.1f%% ont un capital actif (has_capital = Oui), %.1f%% travaillent plus de 50h (high_hours = Oui).",
+    params$occupation,
+    mean(adult_fe$has_capital == "Oui") * 100,
+    mean(adult_fe$high_hours  == "Oui") * 100
+  ))
+}
+```
+
+## Distribution de capital_net
+
+```{r fe-capital-net}
+adult_fe %>%
+  filter(abs(capital_net) > 0) %>%
+  ggplot(aes(x = capital_net, fill = income)) +
+  geom_histogram(bins = 40, position = "dodge", alpha = 0.8) +
+  scale_x_continuous(labels = dollar) +
+  scale_fill_manual(values = c("#E74C3C", "#3498DB")) +
+  labs(title = sprintf("Distribution de capital_net (non-nul) — %s", label_occ),
+       x = "Capital net ($)", y = "Effectif", fill = "Revenu") +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Modélisation
+
+`r if (params$occupation != "All") sprintf("Le modèle est entraîné et évalué exclusivement sur les individus **%s** (n train = %d).", params$occupation, nrow(train_d)) else sprintf("Le modèle est entraîné sur l'ensemble des professions (n train = %d).", nrow(train_d))`
+
+## Pipeline de pré-traitement
+
+```{r recipe-show, eval=FALSE, echo=TRUE}
+rec <- recipe(income ~ ., data = train_d) %>%
+  step_rm(fnlwgt, education) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(income, over_ratio = 0.8)
+```
+
+## Résultats du tuning
+
+```{r tuning-plot}
+autoplot(log_res) +
+  labs(title = sprintf("Tuning elastic net — %s (5-fold CV)", label_occ))
+```
+
+```{r tuning-table}
+collect_metrics(log_res) %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean)) %>%
+  head(10) %>%
+  select(penalty, mixture, mean, std_err) %>%
+  gt() %>%
+  tab_header(title = sprintf("Top 10 AUC-ROC — %s", label_occ)) %>%
+  fmt_number(columns = c(penalty, mixture, mean, std_err), decimals = 4)
+```
+
+---
+
+# Évaluation du meilleur modèle
+
+`r sprintf("Le meilleur modèle pour **%s** atteint un AUC-ROC de **%.3f** et un F1 de **%.3f**.", label_occ, auc_final, f1_final)`
+
+```{r metriques}
+collect_metrics(final_fit) %>%
+  gt() %>%
+  tab_header(title = sprintf("Métriques finales — %s", label_occ))
+```
+
+## Matrice de confusion
+
+```{r confusion-matrix}
+conf_mat(preds, truth = income, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = sprintf("Matrice de confusion — %s", label_occ))
+```
+
+## Courbe ROC
+
+```{r roc-curve}
+preds %>%
+  roc_curve(truth = income, `.pred_>50K`) %>%
+  autoplot() +
+  labs(title = sprintf("Courbe ROC — %s (AUC = %.3f)", label_occ, auc_final))
+```
+
+## Courbe Precision-Recall
+
+```{r pr-curve}
+preds %>%
+  pr_curve(truth = income, `.pred_>50K`) %>%
+  autoplot() +
+  labs(title = sprintf("Courbe Precision-Recall — %s", label_occ))
+```
+
+## Importance des variables
+
+```{r variable-importance, fig.height=6}
+extract_fit_parsnip(final_fit) %>%
+  vip(num_features = 20, geom = "col",
+      aesthetics = list(fill = "#2980B9", alpha = 0.85)) +
+  labs(title = sprintf("Top 20 variables — %s", label_occ))
+```
+
+---
+
+# Rapport paramétré — `r label_occ`
+
+```{r rapport-parametre}
+adult_fe %>%
+  group_by(age_group, income) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = income, values_from = n, values_fill = 0) %>%
+  mutate(taux_risque = percent(`>50K` / (`>50K` + `<=50K`), accuracy = 0.1)) %>%
+  gt() %>%
+  tab_header(title = sprintf("Profil par tranche d'âge — %s", label_occ))
+```
+
+`r if (params$occupation != "All") sprintf("**Synthèse %s :** %d individus analysés, taux de risque global de %s, AUC-ROC spécifique à cette profession de %.3f.", params$occupation, n_total, percent(taux_50k, accuracy=0.1), auc_final)`
+
+---
+
+# Conclusion et recommandations
+
+`r if (params$occupation == "All") { "- Le modèle elastic net atteint des performances solides sur l'ensemble de la population." } else { sprintf("- Sur la profession **%s**, le modèle atteint un AUC-ROC de **%.3f** et un F1 de **%.3f**.", params$occupation, auc_final, f1_final) }`
+
+- Les variables les plus discriminantes sont : le **capital net**, l'**âge**, le **niveau d'éducation** et les **heures travaillées**.
+- Le déséquilibre de classes est traité par **SMOTE** (over_ratio = 0.8).
+
+```{r recommandation-occ, echo=FALSE, results='asis'}
+if (params$occupation != "All") {
+  niveau <- if (taux_50k > 0.4) "surveillance renforcee recommandee" else if (taux_50k > 0.2) "surveillance standard" else "faible risque global"
+  cat(sprintf(
+    "- **Recommandation specifique %s :** taux de risque de %s — %s.",
+    params$occupation,
+    percent(taux_50k, accuracy = 0.1),
+    niveau
+  ))
+}
+```
+
+---
+
+```{r render-rapports-parametres, eval=FALSE, echo=TRUE}
+professions_cibles <- c(
+  "Exec-managerial", "Prof-specialty", "Craft-repair",
+  "Sales", "Tech-support"
+)
+
+walk(professions_cibles, function(occ) {
+  rmarkdown::render(
+    input         = "rapport_fraude_fiscale.Rmd",
+    output_file   = sprintf("rapport_%s.html", str_replace_all(occ, "-", "_")),
+    output_dir    = "reports/",
+    params        = list(occupation = occ),
+    knit_root_dir = getwd()
+  )
+  cat(sprintf("Rapport généré : %s\n", occ))
+})
+```

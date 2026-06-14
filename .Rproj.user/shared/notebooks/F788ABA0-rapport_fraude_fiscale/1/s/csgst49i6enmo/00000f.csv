@@ -1,0 +1,5 @@
+"0","adult_fe %>%"
+"0","  count(income) %>%"
+"0","  mutate(Proportion = percent(n / sum(n), accuracy = 0.1)) %>%"
+"0","  gt() %>%"
+"0","  tab_header(title = sprintf(""Répartition de `income` — %s"", label_occ))"

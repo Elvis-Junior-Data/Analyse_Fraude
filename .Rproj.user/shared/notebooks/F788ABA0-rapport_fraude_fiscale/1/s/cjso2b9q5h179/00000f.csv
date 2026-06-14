@@ -1,0 +1,4 @@
+"0","extract_fit_parsnip(final_fit) %>%"
+"0","  vip(num_features = 20, geom = ""col"","
+"0","      aesthetics = list(fill = ""#2980B9"", alpha = 0.85)) +"
+"0","  labs(title = sprintf(""Top 20 variables — %s"", label_occ))"

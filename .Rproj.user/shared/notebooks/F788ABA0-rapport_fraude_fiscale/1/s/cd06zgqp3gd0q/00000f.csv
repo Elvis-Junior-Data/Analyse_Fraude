@@ -1,0 +1,7 @@
+"0","adult_fe %>%"
+"0","  ggplot(aes(x = hours_per_week, fill = income)) +"
+"0","  geom_density(alpha = 0.5) +"
+"0","  scale_fill_manual(values = c(""#E74C3C"", ""#3498DB"")) +"
+"0","  labs(title = sprintf(""Heures travaillées/semaine — %s"", label_occ),"
+"0","       x = ""Heures/semaine"", y = ""Densité"", fill = ""Revenu"") +"
+"0","  theme_minimal(base_size = 13)"

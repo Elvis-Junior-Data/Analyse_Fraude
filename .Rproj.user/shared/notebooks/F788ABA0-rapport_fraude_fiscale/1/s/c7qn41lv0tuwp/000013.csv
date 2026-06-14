@@ -1,0 +1,8 @@
+"0","collect_metrics(log_res) %>%"
+"0","  filter(.metric == ""roc_auc"") %>%"
+"0","  arrange(desc(mean)) %>%"
+"0","  head(10) %>%"
+"0","  select(penalty, mixture, mean, std_err) %>%"
+"0","  gt() %>%"
+"0","  tab_header(title = ""Top 10 — Résultats AUC-ROC par hyperparamètres"") %>%"
+"0","  fmt_number(columns = c(penalty, mixture, mean, std_err), decimals = 4)"

@@ -1,0 +1,3 @@
+"0","conf_mat(preds, truth = income, estimate = .pred_class) %>%"
+"0","  autoplot(type = ""heatmap"") +"
+"0","  labs(title = sprintf(""Matrice de confusion — %s"", label_occ))"

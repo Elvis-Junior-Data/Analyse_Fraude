@@ -1,0 +1,3 @@
+"0","collect_metrics(final_fit) %>%"
+"0","  gt() %>%"
+"0","  tab_header(title = sprintf(""Métriques finales — %s"", label_occ))"

@@ -1,0 +1,7 @@
+"0","adult_fe %>%"
+"0","  group_by(age_group, income) %>%"
+"0","  summarise(n = n(), .groups = ""drop"") %>%"
+"0","  pivot_wider(names_from = income, values_from = n, values_fill = 0) %>%"
+"0","  mutate(taux_risque = percent(`>50K` / (`>50K` + `<=50K`), accuracy = 0.1)) %>%"
+"0","  gt() %>%"
+"0","  tab_header(title = sprintf(""Profil par tranche d'âge — %s"", label_occ))"

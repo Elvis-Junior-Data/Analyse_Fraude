@@ -1,0 +1,2 @@
+"0","autoplot(log_res) +"
+"0","  labs(title = ""Résultats du tuning — Régression logistique elastic net (5-fold CV)"")"

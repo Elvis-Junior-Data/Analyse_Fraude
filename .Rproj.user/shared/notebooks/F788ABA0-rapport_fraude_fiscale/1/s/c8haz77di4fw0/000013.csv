@@ -1,0 +1,3 @@
+"0","conf_mat_res <- conf_mat(preds, truth = income, estimate = .pred_class)"
+"0","autoplot(conf_mat_res, type = ""heatmap"") +"
+"0","  labs(title = ""Matrice de confusion"")"
